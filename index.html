@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
 <meta name="theme-color" content="#102e4b">
-<title>World Conquest Mobile V15 Server Multiplayer</title>
+<title>World Conquest Mobile V15 Multiplayer Relay</title>
 <style>
 :root{--ocean1:#1e527c;--ocean2:#0a2744;--ink:#142235;--panel:#f2f3f7;--blue:#4bb6ff;--red:#ff5f6f;--green:#61cf89;--gold:#ffd467;--neutral1:#d8d8d8;--neutral2:#8f9498;--muted:#6b7480}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
@@ -79,7 +79,7 @@ button,input,select{font:inherit}.app{height:100%;position:relative;overflow:hid
 (()=>{'use strict';
 const $=id=>document.getElementById(id),svg=$('gameMap'),NS='http://www.w3.org/2000/svg';
 const paths={},labels={}; let state=null,mode=null,local='p1',selected=null,action=null,region='europe',difficulty='medium'; let incomeTimer=null,aiTimer=null,troopTimer=null;
-let peer=null,conn=null,code=null,guestConnected=false,toastTimer=null,connectTimer=null,heartbeatTimer=null,roomTopic='',netRole=null; let view={x:360,y:110,w:520,h:430},drag=null,dragged=false;
+let peer=null,conn=null,code=null,guestConnected=false,toastTimer=null,connectTimer=null,heartbeatTimer=null; let view={x:360,y:110,w:520,h:430},drag=null,dragged=false;
 const europeExtra=new Set(['TUR','CYP','GEO','ARM','AZE']);
 function activeCountries(){return Object.keys(MAP).filter(i=>MAP[i].c==='Europe'||europeExtra.has(i))}
 function isActive(i){return activeCountries().includes(i)}
@@ -216,221 +216,193 @@ function setNetStatus(s,ok=false,bad=false){
  e.style.background=bad?'#4b2028':ok?'#123d2d':'#13273d';
  e.style.color=bad?'#ffd8dd':ok?'#bfffd7':'#d9ecff'
 }
-
-/* Minimal MQTT-over-WebSocket client.
-   This keeps multiplayer self-contained: no PeerJS/CDN and no direct WebRTC/NAT dependency. */
-const _te=new TextEncoder(),_td=new TextDecoder();
-function _u16(n){return[(n>>8)&255,n&255]}
-function _field(s){const b=_te.encode(s);return[..._u16(b.length),...b]}
-function _rem(n){const a=[];do{let d=n%128;n=Math.floor(n/128);if(n>0)d|=128;a.push(d)}while(n>0);return a}
-class MiniMQTT{
- constructor(id){
-  this.id=id;this.ws=null;this.connected=false;this.manual=false;this.pid=1;
-  this.subs=new Set();this.pingTimer=null;this.retryTimer=null;
-  this.onconnect=()=>{};this.onmessage=()=>{};this.onstatus=()=>{};
- }
- connect(){
-  this.manual=false;clearTimeout(this.retryTimer);
-  let ws;
-  try{ws=new WebSocket('wss://broker.emqx.io:8084/mqtt',['mqtt'])}
-  catch(e){this.onstatus('error',e);this._retry();return}
-  this.ws=ws;ws.binaryType='arraybuffer';
-  ws.onopen=()=>this._sendConnect();
-  ws.onmessage=e=>{
-   if(e.data instanceof ArrayBuffer)this._parse(new Uint8Array(e.data));
-   else if(e.data?.arrayBuffer)e.data.arrayBuffer().then(b=>this._parse(new Uint8Array(b))).catch(()=>{})
-  };
-  ws.onerror=e=>this.onstatus('error',e);
-  ws.onclose=()=>{
-   const was=this.connected;this.connected=false;clearInterval(this.pingTimer);
-   this.onstatus('close',was);
-   if(!this.manual)this._retry()
+function loadPeer(cb){
+ if(window.Peer){cb();return}
+ const urls=[
+  'https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js',
+  'https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.5/peerjs.min.js',
+  'https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js'
+ ];
+ let i=0,finished=false;
+ const tryNext=()=>{
+  if(finished)return;
+  if(i>=urls.length){
+   finished=true;
+   setNetStatus('Online-Modul konnte nicht geladen werden. Internet prüfen und neu laden.',false,true);
+   say('Online-Modul konnte nicht geladen werden');
+   return
   }
- }
- _retry(){clearTimeout(this.retryTimer);this.retryTimer=setTimeout(()=>{if(!this.manual)this.connect()},1800)}
- _send(arr){if(this.ws&&this.ws.readyState===WebSocket.OPEN)this.ws.send(new Uint8Array(arr))}
- _sendConnect(){
-  const vh=[..._field('MQTT'),4,2,0,30],pl=_field(this.id);
-  this._send([0x10,..._rem(vh.length+pl.length),...vh,...pl])
- }
- subscribe(topic){
-  this.subs.add(topic);
-  if(!this.connected)return;
-  this.pid=(this.pid%65535)+1;
-  const body=[..._u16(this.pid),..._field(topic),0];
-  this._send([0x82,..._rem(body.length),...body])
- }
- publish(topic,obj){
-  if(!this.connected)return false;
-  const payload=_te.encode(typeof obj==='string'?obj:JSON.stringify(obj));
-  const tf=_field(topic),body=[...tf,...payload];
-  this._send([0x30,..._rem(body.length),...body]);return true
- }
- _parse(buf){
-  let p=0;
-  while(p<buf.length){
-   const h=buf[p++];let mul=1,rl=0,d;
-   do{if(p>=buf.length)return;d=buf[p++];rl+=(d&127)*mul;mul*=128}while(d&128);
-   const end=p+rl;if(end>buf.length)return;
-   const type=h>>4;
-   if(type===2){
-    const rc=buf[p+1];
-    if(rc===0){
-     this.connected=true;
-     for(const s of this.subs)this.subscribe(s);
-     clearInterval(this.pingTimer);
-     this.pingTimer=setInterval(()=>this._send([0xC0,0]),18000);
-     this.onconnect()
-    }else this.onstatus('connack',rc)
-   }else if(type===3){
-    let q=p;
-    if(q+2<=end){
-     const tl=(buf[q]<<8)|buf[q+1];q+=2;
-     if(q+tl<=end){
-      const topic=_td.decode(buf.slice(q,q+tl));q+=tl;
-      const qos=(h>>1)&3;if(qos>0)q+=2;
-      const payload=_td.decode(buf.slice(q,end));
-      this.onmessage(topic,payload)
-     }
-    }
-   }
-   p=end
-  }
- }
- close(){
-  this.manual=true;clearTimeout(this.retryTimer);clearInterval(this.pingTimer);
-  try{if(this.ws?.readyState===WebSocket.OPEN)this._send([0xE0,0])}catch{}
-  try{this.ws?.close()}catch{};this.connected=false
- }
+  const s=document.createElement('script');
+  s.src=urls[i++];s.async=true;
+  let done=false;
+  const timer=setTimeout(()=>{if(done)return;done=true;s.remove();tryNext()},7000);
+  s.onload=()=>{if(done)return;done=true;clearTimeout(timer);finished=true;cb()};
+  s.onerror=()=>{if(done)return;done=true;clearTimeout(timer);s.remove();tryNext()};
+  document.head.appendChild(s)
+ };
+ tryNext()
 }
-function makeClientId(role){
- return ('wc15'+role[0]+Date.now().toString(36)+Math.random().toString(36).slice(2,7)).slice(0,22)
+const RTC_CONFIG={iceServers:[
+ {urls:['stun:stun.l.google.com:19302','stun:stun1.l.google.com:19302','stun:stun2.l.google.com:19302']},
+ {urls:'stun:stun.relay.metered.ca:80'},
+ {urls:'turn:global.relay.metered.ca:80',username:'openrelayproject',credential:'openrelayproject'},
+ {urls:'turn:global.relay.metered.ca:80?transport=tcp',username:'openrelayproject',credential:'openrelayproject'},
+ {urls:'turn:global.relay.metered.ca:443',username:'openrelayproject',credential:'openrelayproject'},
+ {urls:'turns:global.relay.metered.ca:443?transport=tcp',username:'openrelayproject',credential:'openrelayproject'}
+],iceCandidatePoolSize:4};
+function makePeer(id){
+ const opts={debug:1,config:RTC_CONFIG};
+ return id ? new Peer(id,opts) : new Peer(opts)
 }
 function stopNetworkTimers(){
- clearTimeout(connectTimer);clearInterval(connectTimer);clearInterval(heartbeatTimer);
- connectTimer=null;heartbeatTimer=null
-}
-function closeOnline(){
- stopNetworkTimers();
- try{peer?.close()}catch{}
- peer=null;conn=null;netRole=null;roomTopic=''
-}
-function makeCode(){return String(Math.floor(1000+Math.random()*9000))}
-function makeConn(role){
- return{
-  open:true,
-  send:m=>peer?.publish(roomTopic+(role==='host'?'/to-guest':'/to-host'),{...m,_t:Date.now()}),
-  close:()=>{}
- }
-}
-function send(m){
- if(conn?.open&&conn.send(m)!==false)return;
- say('Noch keine Verbindung');setNetStatus('Noch keine Verbindung zum anderen Handy',false,true)
-}
-function broadcast(){if(mode==='host'&&conn?.open)conn.send({type:'state',state,region})}
-
-function prepareHostState(){
- closeOnline();guestConnected=false;
- mode='host';netRole='host';local='p1';state=blank();
- state.names.p1=$('hostName').value.trim()||'Spieler 1';
- state.names.p2='Spieler 2';
- code=makeCode();roomTopic='world-conquest-mobile/v15/'+code;
- $('roomCode').textContent=code;renderLobby();modal('lobbyModal');
- setNetStatus('Raum '+code+' wird mit Spielserver verbunden…')
-}
-function hostRoom(){
- prepareHostState();
- peer=new MiniMQTT(makeClientId('host'));
- peer.onstatus=(kind,val)=>{
-  if(kind==='error')setNetStatus('Spielserver wird neu verbunden…');
-  if(kind==='close'){if(conn)conn.open=false;setNetStatus('Spielserver getrennt · automatische Neuverbindung…',false,true)}
-  if(kind==='connack')setNetStatus('Spielserver lehnt Verbindung ab ('+val+')',false,true)
- };
- peer.onconnect=()=>{
-  peer.subscribe(roomTopic+'/to-host');
-  conn=makeConn('host');
-  setNetStatus('✅ Raum '+code+' bereit · Code auf Handy 2 eingeben',true);
-  startHeartbeat()
- };
- peer.onmessage=(topic,payload)=>{
-  if(topic!==roomTopic+'/to-host')return;
-  try{hostData(JSON.parse(payload))}catch{}
- };
- peer.connect()
+ clearTimeout(connectTimer);clearInterval(heartbeatTimer);connectTimer=null;heartbeatTimer=null
 }
 function startHeartbeat(){
  clearInterval(heartbeatTimer);
  heartbeatTimer=setInterval(()=>{
-  if(conn?.open)conn.send({type:'ping',t:Date.now()})
- },5000)
+  if(conn?.open){try{conn.send({type:'ping',t:Date.now()})}catch{}}
+ },4000)
+}
+function makeCode(){return String(Math.floor(1000+Math.random()*9000))}
+function send(m){
+ if(conn?.open)conn.send(m);
+ else{say('Noch keine Verbindung');setNetStatus('Noch keine Verbindung zum anderen Handy',false,true)}
+}
+function broadcast(){if(mode==='host'&&conn?.open)conn.send({type:'state',state,region})}
+
+function prepareHostState(){
+ stopNetworkTimers();
+ try{conn?.close()}catch{} try{peer?.destroy()}catch{}
+ conn=null;peer=null;guestConnected=false;
+ mode='host';local='p1';state=blank();
+ state.names.p1=$('hostName').value.trim()||'Spieler 1';
+ state.names.p2='Spieler 2';
+ code=makeCode();
+ $('roomCode').textContent=code;
+ renderLobby();
+ modal('lobbyModal');
+ setNetStatus('Raum '+code+' wird erstellt…')
+}
+function attachHostPeer(){
+ const wanted='wc15-'+code;
+ peer=makePeer(wanted);
+ let opened=false;
+ const readyTimeout=setTimeout(()=>{
+  if(!opened){
+   setNetStatus('Raumserver antwortet langsam. Noch einen Moment…');
+  }
+ },6000);
+
+ peer.on('open',id=>{
+  opened=true;clearTimeout(readyTimeout);
+  setNetStatus('✅ Raum '+code+' bereit · Code auf Handy 2 eingeben',true)
+ });
+ peer.on('connection',c=>{
+  if(guestConnected&&conn?.open){
+   c.on('open',()=>{try{c.send({type:'reject',reason:'Raum ist voll'})}catch{};c.close()});
+   return
+  }
+  conn=c;setNetStatus('Spieler 2 verbindet sich…');
+  c.on('open',()=>{
+   guestConnected=true;renderLobby();setNetStatus('✅ Beide Handys verbunden',true);
+   broadcast();startHeartbeat()
+  });
+  c.on('data',hostData);
+  c.on('close',()=>{
+   guestConnected=false;renderLobby();setNetStatus('Spieler 2 getrennt · Raum bleibt offen',false,true)
+  });
+  c.on('error',()=>setNetStatus('Fehler bei Verbindung mit Spieler 2',false,true))
+ });
+ peer.on('disconnected',()=>{
+  setNetStatus('Raumserver kurz getrennt · verbinde neu…');
+  try{peer.reconnect()}catch{}
+ });
+ peer.on('error',e=>{
+  clearTimeout(readyTimeout);
+  if(e.type==='unavailable-id'){
+   try{peer.destroy()}catch{}
+   code=makeCode();$('roomCode').textContent=code;renderLobby();
+   setNetStatus('Code war belegt · neuer Code '+code+' wird erstellt…');
+   setTimeout(attachHostPeer,300);
+   return
+  }
+  const msg=e.type==='network'?'Raumserver nicht erreichbar · Internet prüfen':'Raumfehler: '+e.type;
+  setNetStatus(msg,false,true);say(msg)
+ })
+}
+function hostRoom(){
+ // Show the 4-digit room code immediately, even before the online library loads.
+ prepareHostState();
+ loadPeer(()=>{
+  setNetStatus('Raum '+code+' wird beim Server angemeldet…');
+  attachHostPeer()
+ })
 }
 
 function joinRoom(){
  const room=$('roomInput').value.trim().replace(/\D/g,'');
  if(room.length!==4){say('Bitte 4 Ziffern eingeben');return}
- closeOnline();guestConnected=false;
- mode='guest';netRole='guest';local='p2';state=blank();
+ stopNetworkTimers();
+ try{conn?.close()}catch{} try{peer?.destroy()}catch{}
+ conn=null;peer=null;guestConnected=false;
+ mode='guest';local='p2';state=blank();
  state.names.p2=$('guestName').value.trim()||'Spieler 2';
- code=room;roomTopic='world-conquest-mobile/v15/'+code;
+ code=room;
  modal('lobbyModal');$('roomCode').textContent=room;renderLobby();
- setNetStatus('Verbinde mit Spielserver…');
+ setNetStatus('1/3 · Suche Raum '+room+' …');
 
- peer=new MiniMQTT(makeClientId('guest'));
- peer.onstatus=(kind,val)=>{
-  if(kind==='error')setNetStatus('Spielserver wird neu verbunden…');
-  if(kind==='close'){if(conn)conn.open=false;guestConnected=false;renderLobby();setNetStatus('Verbindung unterbrochen · automatische Neuverbindung…',false,true)}
-  if(kind==='connack')setNetStatus('Spielserver lehnt Verbindung ab ('+val+')',false,true)
- };
- peer.onconnect=()=>{
-  peer.subscribe(roomTopic+'/to-guest');
-  conn=makeConn('guest');
-  setNetStatus('Spielserver verbunden · suche Raum '+room+' …');
-  let tries=0;
-  clearInterval(connectTimer);
-  const hello=()=>{
-   if(guestConnected){clearInterval(connectTimer);return}
-   tries++;
-   conn.send({type:'hello',name:state.names.p2});
-   if(tries>=15){
-    clearInterval(connectTimer);
-    if(!guestConnected){
-     setNetStatus('Raum '+room+' nicht gefunden. Host muss „Raum bereit“ anzeigen.',false,true);
-     say('Raum nicht gefunden')
+ loadPeer(()=>{
+  peer=makePeer();
+  peer.on('open',()=>{
+   setNetStatus('2/3 · Raum gefunden · sichere Verbindung wird aufgebaut…');
+   conn=peer.connect('wc15-'+room,{serialization:'json',reliable:true});
+   connectTimer=setTimeout(()=>{
+    if(!conn?.open){
+     setNetStatus('Raum '+room+' nicht erreichbar. Code prüfen oder Host neu erstellen.',false,true);
+     say('Raum nicht erreichbar')
     }
-   }
-  };
-  hello();connectTimer=setInterval(hello,1200);
-  startHeartbeat()
- };
- peer.onmessage=(topic,payload)=>{
-  if(topic!==roomTopic+'/to-guest')return;
-  try{guestData(JSON.parse(payload))}catch{}
- };
- peer.connect()
-}
-function guestData(m){
- if(m.type==='helloAck'){
-  guestConnected=true;clearInterval(connectTimer);
-  if(m.name)state.names.p1=String(m.name).slice(0,20);
-  setNetStatus('✅ Mit Raum '+code+' verbunden',true);renderLobby()
- }else if(m.type==='state'){
-  guestConnected=true;clearInterval(connectTimer);
-  state=m.state;setRegion('europe');render();renderLobby();
-  setNetStatus('✅ Mit Raum '+code+' verbunden',true);
-  if(state.phase!=='setup')hideModals()
- }else if(m.type==='notice'){
-  say(m.msg);if(m.fx)fx(m.fx)
- }else if(m.type==='reject'){
-  setNetStatus(m.reason||'Raum ist voll',false,true);say(m.reason||'Raum ist voll')
- }else if(m.type==='ping'){
-  if(conn?.open)conn.send({type:'pong',t:m.t})
- }
+   },22000);
+   conn.on('open',()=>{
+    clearTimeout(connectTimer);guestConnected=true;
+    conn.send({type:'hello',name:state.names.p2});
+    setNetStatus('3/3 · ✅ Beide Handys verbunden',true);
+    renderLobby();startHeartbeat()
+   });
+   conn.on('data',m=>{
+    if(m.type==='state'){
+     state=m.state;setRegion('europe');render();renderLobby();
+     if(state.phase!=='setup')hideModals()
+    }else if(m.type==='notice'){
+     say(m.msg);if(m.fx)fx(m.fx)
+    }else if(m.type==='reject'){
+     setNetStatus(m.reason||'Raum ist voll',false,true);say(m.reason||'Raum ist voll')
+    }else if(m.type==='ping'){
+     if(conn?.open)conn.send({type:'pong',t:m.t})
+    }
+   });
+   conn.on('close',()=>{
+    guestConnected=false;setNetStatus('Verbindung zum Host getrennt',false,true);say('Verbindung getrennt')
+   });
+   conn.on('error',e=>{console.error(e);setNetStatus('Verbindungsfehler zum Host · bitte erneut versuchen',false,true)})
+  });
+  peer.on('error',e=>{
+   const msg=e.type==='peer-unavailable'
+    ? 'Raum '+room+' nicht gefunden · Code prüfen'
+    : e.type==='network'
+      ? 'Raumserver nicht erreichbar · Internet prüfen'
+      : 'Verbindung fehlgeschlagen: '+e.type;
+   setNetStatus(msg,false,true);say(msg)
+  });
+  peer.on('disconnected',()=>{
+   setNetStatus('Raumserver kurz getrennt · verbinde neu…');
+   try{peer.reconnect()}catch{}
+  })
+ })
 }
 function hostData(m){
  if(m.type==='hello'){
   state.names.p2=String(m.name||'Spieler 2').slice(0,20);
   guestConnected=true;renderLobby();setNetStatus('✅ Beide Handys verbunden',true);
-  if(conn?.open)conn.send({type:'helloAck',name:state.names.p1});
   broadcast();render()
  }else if(m.type==='startPick'&&state.phase==='setup'&&isActive(m.iso)&&state.starts.p1!==m.iso){
   state.starts.p2=m.iso;pulse(m.iso);broadcast();render()
@@ -444,7 +416,7 @@ function hostData(m){
 }
 
 function renderLobby(){if(!state)return;$('hostLobby').textContent=state.names.p1;$('guestLobby').textContent=guestConnected?state.names.p2:'Warte auf Spieler 2…';$('guestDot').classList.toggle('ok',guestConnected)}
-function goMenu(){clearRealtime();closeOnline();guestConnected=false;state=null;mode=null;selected=null;action=null;modal('menuModal');render()}
+function goMenu(){clearRealtime();stopNetworkTimers();try{conn?.close()}catch{}try{peer?.destroy()}catch{}conn=null;peer=null;guestConnected=false;state=null;mode=null;selected=null;action=null;modal('menuModal');render()}
 $('regionBtn').onclick=()=>say('Nur Europa aktiv');
 $('soloOpen').onclick=()=>modal('soloModal');$('hostOpen').onclick=()=>modal('hostModal');$('joinOpen').onclick=()=>modal('joinModal');$('helpOpen').onclick=()=>modal('helpModal');document.querySelectorAll('[data-close]').forEach(b=>b.onclick=()=>modal('menuModal'));
 $('soloStartSetup').onclick=()=>{mode='solo';local='p1';difficulty=$('difficulty').value;state=blank();state.names.p1=$('soloName').value.trim()||'Spieler 1';state.names.p2='KI';hideModals();render();say('Wähle dein Startland')};
